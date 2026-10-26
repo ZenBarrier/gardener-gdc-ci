@@ -418,9 +418,28 @@ var GetShootKubeconfig = func(ctx context.Context, gardenClient client.Client, s
 	return kubeconfigBytes, nil
 }
 
+// GetShootName returns the Shoot name for a 0-based Shoot index.
+// Index 0 returns baseName; index >= 1 returns "<baseName>-<index+1>".
+func GetShootName(baseName string, index int) string {
+	if index <= 0 {
+		return baseName
+	}
+	return fmt.Sprintf("%s-%d", baseName, index+1)
+}
+
 // GetShootParentSubnetName returns the name of the parent subnet for a given commit hash.
 func GetShootParentSubnetName(commitHash string) string {
 	return fmt.Sprintf("release-subnet-%s", commitHash)
+}
+
+// GetShootParentSubnetNameForIndex returns the parent subnet name for a 0-based Shoot index.
+// Index 0 returns "release-subnet-<commitHash>"; index >= 1 returns "release-subnet-<commitHash>-<index+1>".
+func GetShootParentSubnetNameForIndex(commitHash string, index int) string {
+	base := GetShootParentSubnetName(commitHash)
+	if index <= 0 {
+		return base
+	}
+	return fmt.Sprintf("%s-%d", base, index+1)
 }
 
 // GetShootKubeconfigPath retrieves the kubeconfig for a given Shoot cluster,

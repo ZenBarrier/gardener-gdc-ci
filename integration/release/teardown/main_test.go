@@ -19,12 +19,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
 	gardenv1beta1constants "github.com/gardener/gardener/pkg/apis/core/v1beta1/constants"
 	operatorv1alpha1 "github.com/gardener/gardener/pkg/apis/operator/v1alpha1"
+	ipamglobalv1 "github.com/googlecloudplatform/google-distributed-cloud-apis/pkg/apis/public/global/ipam/v1"
 	globalobjectv1 "github.com/googlecloudplatform/google-distributed-cloud-apis/pkg/apis/public/global/object/v1"
 	objectv1 "github.com/googlecloudplatform/google-distributed-cloud-apis/pkg/apis/public/object/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -45,6 +47,7 @@ var (
 	gardenerArtifactsVersion     = flag.String("gardener-artifacts-version", "", "The version string for Gardener artifacts")
 	releaseConfigurationFilePath = flag.String("release-configuration-file-path", "", "the path to the release configuration file")
 	virtualGardenProvider        = flag.String("virtual-garden-provider", "gke", "the provider type hosting the Virtual Garden ('gke' or 'gdc')")
+	numShoots                    = flag.Int("num-shoots", 1, "The number of Shoot clusters to delete")
 )
 
 const (
@@ -87,24 +90,30 @@ func TestCleanupResources(t *testing.T) {
 
 	ctx := context.Background()
 	shootDeleted := t.Run("Delete Shoot Cluster", func(t *testing.T) {
-		t.Logf("Deleting Shoot cluster %s", releasePipelineCfg.TestShoot.Name)
-		shootKey := client.ObjectKey{Name: releasePipelineCfg.TestShoot.Name, Namespace: releasePipelineCfg.TestShoot.Namespace}
-		if err := deleteAndWaitForDeletion(ctx, releasePipelineCfg.TestShoot.VirtualGarden.Client, &gardencorev1beta1.Shoot{}, shootKey); err != nil {
-			t.Fatalf("Failed to delete Shoot cluster: %v", err)
+		shootNames := collectTargetShootNames(ctx, releasePipelineCfg.TestShoot.VirtualGarden.Client, releasePipelineCfg.TestShoot.Namespace, releasePipelineCfg.TestShoot.Name, *numShoots)
+		for _, shootName := range shootNames {
+			t.Logf("Deleting Shoot cluster %s", shootName)
+			shootKey := client.ObjectKey{Name: shootName, Namespace: releasePipelineCfg.TestShoot.Namespace}
+			if err := deleteAndWaitForDeletion(ctx, releasePipelineCfg.TestShoot.VirtualGarden.Client, &gardencorev1beta1.Shoot{}, shootKey); err != nil {
+				t.Fatalf("Failed to delete Shoot cluster %s: %v", shootKey, err)
+			}
+			t.Logf("Shoot cluster '%s' deleted successfully.", shootKey)
 		}
-		t.Logf("Shoot cluster '%s' deleted successfully.", shootKey)
 	})
 	if !shootDeleted {
 		t.Fatalf("Delete Shoot Cluster failed, stopping further cleanup and annotation removal to prevent premature release")
 	}
 
 	subnetDeleted := t.Run("DeleteParentSubnet", func(t *testing.T) {
-		t.Logf("Deleting parent subnet for commit %s", *gardenerArtifactsVersion)
-		subnetKey := client.ObjectKey{Name: gardener.GetShootParentSubnetName(*gardenerArtifactsVersion), Namespace: releasePipelineCfg.GDC.Project}
-		if err := subnet.DeleteSubnet(ctx, releasePipelineCfg.GlobalAPIClient, subnetKey, waitForDeletionTimeout, t); err != nil {
-			t.Fatalf("Failed to delete parent subnet: %v", err)
+		t.Logf("Deleting parent subnet(s) for commit %s", *gardenerArtifactsVersion)
+		subnetNames := collectTargetSubnetNames(ctx, releasePipelineCfg.GlobalAPIClient, releasePipelineCfg.GDC.Project, *gardenerArtifactsVersion, *numShoots)
+		for _, subnetName := range subnetNames {
+			subnetKey := client.ObjectKey{Name: subnetName, Namespace: releasePipelineCfg.GDC.Project}
+			if err := subnet.DeleteSubnet(ctx, releasePipelineCfg.GlobalAPIClient, subnetKey, waitForDeletionTimeout, t); err != nil {
+				t.Fatalf("Failed to delete parent subnet %s: %v", subnetKey, err)
+			}
+			t.Logf("Parent subnet '%s' deleted successfully.", subnetKey)
 		}
-		t.Logf("Parent subnet '%s' deleted successfully.", subnetKey)
 	})
 	if !subnetDeleted {
 		t.Fatalf("Failed to delete parent subnet, stopping further cleanup and annotation removal")
@@ -196,6 +205,67 @@ func TestCleanupResources(t *testing.T) {
 		gardenKey := client.ObjectKey{Name: garden.Name, Namespace: garden.Namespace}
 		removeAnnotation(ctx, t, releasePipelineCfg.RuntimeClusterClient, &garden, gardenKey, releaseConfig.CommitHashAnnotation, *gardenerArtifactsVersion)
 	})
+}
+
+func collectTargetShootNames(ctx context.Context, gardenClient client.Client, namespace, baseShootName string, count int) []string {
+	if count < 1 {
+		count = 1
+	}
+	seen := make(map[string]struct{}, count)
+	var names []string
+	for i := 0; i < count; i++ {
+		name := gardener.GetShootName(baseShootName, i)
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	if gardenClient != nil {
+		shootList := &gardencorev1beta1.ShootList{}
+		if err := gardenClient.List(ctx, shootList, client.InNamespace(namespace)); err == nil {
+			prefix := baseShootName + "-"
+			for _, s := range shootList.Items {
+				if s.Name == baseShootName || strings.HasPrefix(s.Name, prefix) {
+					if _, ok := seen[s.Name]; !ok {
+						seen[s.Name] = struct{}{}
+						names = append(names, s.Name)
+					}
+				}
+			}
+		}
+	}
+	return names
+}
+
+func collectTargetSubnetNames(ctx context.Context, globalClient client.Client, namespace, commitHash string, count int) []string {
+	if count < 1 {
+		count = 1
+	}
+	seen := make(map[string]struct{}, count)
+	var names []string
+	for i := 0; i < count; i++ {
+		name := gardener.GetShootParentSubnetNameForIndex(commitHash, i)
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	if globalClient != nil {
+		baseName := gardener.GetShootParentSubnetName(commitHash)
+		prefix := baseName + "-"
+		subnetList := &ipamglobalv1.SubnetList{}
+		if err := globalClient.List(ctx, subnetList, client.InNamespace(namespace)); err == nil {
+			for _, s := range subnetList.Items {
+				if s.Name == baseName || strings.HasPrefix(s.Name, prefix) {
+					if _, ok := seen[s.Name]; !ok {
+						seen[s.Name] = struct{}{}
+						names = append(names, s.Name)
+					}
+				}
+			}
+		}
+	}
+	return names
 }
 
 // deleteAndWaitForDeletion deletes a k8s resource and waits until it is gone.

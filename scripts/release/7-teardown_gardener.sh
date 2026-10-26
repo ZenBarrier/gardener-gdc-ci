@@ -20,6 +20,7 @@ fi
 
 GARDENER_ARTIFACTS_VERSION="$(yq -r '.gardenerArtifactsVersion' "${RELEASE_METADATA_FILE}")"
 VIRTUAL_GARDEN_PROVIDER="${VIRTUAL_GARDEN_PROVIDER:-gke}"
+NUM_SHOOTS="${NUM_SHOOTS:-1}"
 
 TEARDOWN_SUCCESS=false
 for attempt in 1 2 3; do
@@ -28,7 +29,8 @@ for attempt in 1 2 3; do
     -args \
     --release-configuration-file-path="${UPDATED_PIPELINE_CONFIG_FILE}" \
     --gardener-artifacts-version="${GARDENER_ARTIFACTS_VERSION}" \
-    --virtual-garden-provider="${VIRTUAL_GARDEN_PROVIDER}"; then
+    --virtual-garden-provider="${VIRTUAL_GARDEN_PROVIDER}" \
+    --num-shoots="${NUM_SHOOTS}"; then
     TEARDOWN_SUCCESS=true
     break
   fi
