@@ -17,6 +17,7 @@ package subnet
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -179,6 +180,50 @@ func DeleteSubnet(ctx context.Context, c client.Client, key client.ObjectKey, ti
 	if err != nil {
 		subnetYAML := diagnostics.GetObjectYAML(ctx, c, key, &ipamglobalv1.Subnet{})
 		return fmt.Errorf("subnet %s not deleted (timeout):\n%s\nerror: %w", key.Name, subnetYAML, err)
+	}
+	return nil
+}
+
+// ValidateParentSubnetGroupCapacity checks whether the parent subnet group in namespace has
+// sufficient IPv4 capacity to allocate numShoots subnets of prefixLength (/prefixLength).
+// If no Subnet objects labeled with ipam.gdc.goog/subnet-group=<parentSubnetGroup> are returned,
+// validation is skipped so callers without list access or pre-labeled groups are not blocked.
+func ValidateParentSubnetGroupCapacity(ctx context.Context, c client.Client, namespace, parentSubnetGroup string, numShoots, prefixLength int) error {
+	if c == nil || parentSubnetGroup == "" || numShoots <= 0 || prefixLength <= 0 || prefixLength > 32 {
+		return nil
+	}
+	subnetList := &ipamglobalv1.SubnetList{}
+	if err := c.List(ctx, subnetList, client.InNamespace(namespace), client.MatchingLabels{ipamv1.SubnetGroupLabel: parentSubnetGroup}); err != nil {
+		return nil
+	}
+
+	var totalParentIPs int64
+	minParentPrefix := 33
+	for _, s := range subnetList.Items {
+		if s.Status.IPv4Allocation == nil || s.Status.IPv4Allocation.CIDR == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(s.Status.IPv4Allocation.CIDR)
+		if err != nil || !p.Addr().Is4() {
+			continue
+		}
+		if p.Bits() < minParentPrefix {
+			minParentPrefix = p.Bits()
+		}
+		totalParentIPs += int64(1) << (32 - p.Bits())
+	}
+	if totalParentIPs == 0 {
+		return nil
+	}
+
+	if prefixLength < minParentPrefix {
+		return fmt.Errorf("requested subnet prefix /%d is larger than parent subnet group %q (/%d)", prefixLength, parentSubnetGroup, minParentPrefix)
+	}
+
+	requiredIPs := int64(numShoots) * (int64(1) << (32 - prefixLength))
+	if requiredIPs > totalParentIPs {
+		return fmt.Errorf("requested %d Shoot subnet(s) of /%d (%d IPs total) exceeds parent subnet group %q total capacity (%d IPs)",
+			numShoots, prefixLength, requiredIPs, parentSubnetGroup, totalParentIPs)
 	}
 	return nil
 }

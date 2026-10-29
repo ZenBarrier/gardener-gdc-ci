@@ -46,8 +46,8 @@ const (
 )
 
 // newShootSpec constructs the spec for the Shoot cluster using the provided configuration.
-func newShootSpec(t *testing.T, cfg *config.ReleaseTestConfig, shootNodeCIDR, gardenerArtifactsVersion string, workerPoolMinimum, workerPoolMaximum int32) gardencorev1beta1.ShootSpec {
-	t.Logf("Creating Shoot spec for Gardener-GDC with zones: %v (worker pool minimum=%d, maximum=%d)", cfg.GDC.Zones, workerPoolMinimum, workerPoolMaximum)
+func newShootSpec(t *testing.T, cfg *config.ReleaseTestConfig, shootName, parentSubnetName, shootNodeCIDR string, workerPoolMinimum, workerPoolMaximum int32) gardencorev1beta1.ShootSpec {
+	t.Logf("Creating Shoot spec for %s on Gardener-GDC with zones: %v (worker pool minimum=%d, maximum=%d)", shootName, cfg.GDC.Zones, workerPoolMinimum, workerPoolMaximum)
 	var workerPools []gardencorev1beta1.Worker
 	var infraConfigZones []map[string]interface{}
 	shootNodeCIDRs, err := splitCIDR(shootNodeCIDR)
@@ -80,7 +80,7 @@ func newShootSpec(t *testing.T, cfg *config.ReleaseTestConfig, shootNodeCIDR, ga
 			"CIDR": shootNodeCIDRs[i],
 		})
 	}
-	t.Logf("Infrastructure config: parentSubnet=%s, parentSubnetProject=%s, nodeCIDR=%s", gardener.GetShootParentSubnetName(gardenerArtifactsVersion), cfg.GDC.Project, shootNodeCIDR)
+	t.Logf("Infrastructure config: parentSubnet=%s, parentSubnetProject=%s, nodeCIDR=%s", parentSubnetName, cfg.GDC.Project, shootNodeCIDR)
 	return gardencorev1beta1.ShootSpec{
 		ControlPlane: &gardencorev1beta1.ControlPlane{
 			HighAvailability: &gardencorev1beta1.HighAvailability{
@@ -99,7 +99,7 @@ func newShootSpec(t *testing.T, cfg *config.ReleaseTestConfig, shootNodeCIDR, ga
 			Name: string(cloudprofileName),
 		},
 		DNS: &gardencorev1beta1.DNS{
-			Domain: ptr.To(cfg.TestShoot.Name + "." + gardenv1beta1constants.GardenNamespace + "." + cfg.GDC.ManagedDNSDomainName),
+			Domain: ptr.To(shootName + "." + gardenv1beta1constants.GardenNamespace + "." + cfg.GDC.ManagedDNSDomainName),
 		},
 		Kubernetes: gardencorev1beta1.Kubernetes{
 			Version: cfg.Gardener.KubernetesVersion,
@@ -124,7 +124,7 @@ func newShootSpec(t *testing.T, cfg *config.ReleaseTestConfig, shootNodeCIDR, ga
 					"kind":       "InfrastructureConfig",
 					"networks": map[string]interface{}{
 						"nodeCIDR":            shootNodeCIDR,
-						"parentSubnet":        gardener.GetShootParentSubnetName(gardenerArtifactsVersion),
+						"parentSubnet":        parentSubnetName,
 						"parentSubnetProject": cfg.GDC.Project,
 						"zones":               infraConfigZones,
 					},

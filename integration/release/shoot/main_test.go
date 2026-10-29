@@ -51,6 +51,7 @@ var (
 	externalDNSManagementImageName = flag.String("external-dns-management-image-name", "external-dnsman2-gdch", "The name of the external DNS management image")
 	releaseConfigurationFilePath   = flag.String("release-configuration-file-path", "", "the path to the release configuration file")
 	virtualGardenProvider          = flag.String("virtual-garden-provider", "gke", "the provider type hosting the Virtual Garden ('gke' or 'gdc')")
+	numShoots                      = flag.Int("num-shoots", 1, "The number of Shoot clusters to create")
 	workerPoolMinimum              = flag.Int("worker-pool-minimum", 2, "The minimum number of machines per worker pool")
 	workerPoolMaximum              = flag.Int("worker-pool-maximum", 2, "The maximum number of machines per worker pool")
 )
@@ -80,6 +81,7 @@ const (
 	// - With /26, IPAM failed with "No resource could allocate a /31 CIDR", causing LB IP
 	//   allocation timeouts and cascading test failures.
 	subnetPrefixLength        = 27
+	maxNumShoots              = 64
 	waitForSubnetReadyTimeout = 5 * time.Minute
 )
 
@@ -100,19 +102,7 @@ func TestCreateShootCluster(t *testing.T) {
 		defer releasePipelineCfg.GDCClient.Cleanup()
 	}
 
-	// create shoot's parent subnet
 	ctx := context.Background()
-	t.Logf("Ensuring shoot parent subnet for commit %s", *gardenerArtifactsVersion)
-	subnetName := gardener.GetShootParentSubnetName(*gardenerArtifactsVersion)
-	shootNodeCIDR, err := subnet.EnsureSubnet(ctx, releasePipelineCfg.GlobalAPIClient, subnet.SubnetOptions{
-		Namespace:         releasePipelineCfg.GDC.Project,
-		Name:              subnetName,
-		ParentSubnetGroup: releasePipelineCfg.GDC.ParentPrivateSubnetGroup,
-		PrefixLength:      subnetPrefixLength,
-	}, waitForSubnetReadyTimeout, t)
-	if err != nil {
-		t.Fatalf("failed to ensure subnet %s", err)
-	}
 
 	// Create Image Pull Secret
 	gardenClient := releasePipelineCfg.TestShoot.VirtualGarden.Client
@@ -155,20 +145,52 @@ func TestCreateShootCluster(t *testing.T) {
 	t.Logf("Creating CloudProfile %s", cloudprofileName)
 	createCloudprofile(ctx, gardenClient, releasePipelineCfg, t)
 
-	// Create Shoot cluster
-	t.Logf("Creating Shoot cluster %s", releasePipelineCfg.TestShoot.Name)
-	createShoot(ctx, gardenClient, releasePipelineCfg, shootNodeCIDR, *gardenerArtifactsVersion, int32(*workerPoolMinimum), int32(*workerPoolMaximum), t)
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
+
+	if err := subnet.ValidateParentSubnetGroupCapacity(ctx, releasePipelineCfg.GlobalAPIClient, releasePipelineCfg.GDC.Project, releasePipelineCfg.GDC.ParentPrivateSubnetGroup, *numShoots, subnetPrefixLength); err != nil {
+		t.Fatalf("invalid parent subnet group capacity: %v", err)
+	}
+
+	var shootKeys []client.ObjectKey
+	for i := 0; i < *numShoots; i++ {
+		shootName := gardener.GetShootName(releasePipelineCfg.TestShoot.Name, i)
+		subnetName := gardener.GetShootParentSubnetNameForIndex(*gardenerArtifactsVersion, i)
+
+		t.Logf("Ensuring shoot parent subnet %s for Shoot %s (%d/%d)", subnetName, shootName, i+1, *numShoots)
+		shootNodeCIDR, err := subnet.EnsureSubnet(ctx, releasePipelineCfg.GlobalAPIClient, subnet.SubnetOptions{
+			Namespace:         releasePipelineCfg.GDC.Project,
+			Name:              subnetName,
+			ParentSubnetGroup: releasePipelineCfg.GDC.ParentPrivateSubnetGroup,
+			PrefixLength:      subnetPrefixLength,
+		}, waitForSubnetReadyTimeout, t)
+		if err != nil {
+			t.Fatalf("failed to ensure subnet %s: %v", subnetName, err)
+		}
+
+		t.Logf("Creating Shoot cluster %s (%d/%d)", shootName, i+1, *numShoots)
+		shootKey := startShootCreation(ctx, watchCtx, gardenClient, releasePipelineCfg, shootName, subnetName, shootNodeCIDR, int32(*workerPoolMinimum), int32(*workerPoolMaximum), t)
+		shootKeys = append(shootKeys, shootKey)
+	}
+
+	for i, shootKey := range shootKeys {
+		t.Logf("Waiting for Shoot cluster %s/%s (%d/%d) to reconcile...", shootKey.Namespace, shootKey.Name, i+1, len(shootKeys))
+		if err := gardener.WaitForShootReconciliation(ctx, gardenClient, shootKey, waitForShootCreationTimeout); err != nil {
+			t.Fatalf("shoot \"%q/%q\" reconciliation failed or timed out: %v", shootKey.Namespace, shootKey.Name, err)
+		}
+		t.Logf("Shoot cluster %s/%s reconciled successfully.", shootKey.Namespace, shootKey.Name)
+	}
 }
 
-func createShoot(ctx context.Context, gardenClient client.WithWatch, cfg *config.ReleaseTestConfig, shootNodeCIDR, gardenerArtifactsVersion string, workerMin, workerMax int32, t *testing.T) {
+func startShootCreation(ctx, watchCtx context.Context, gardenClient client.WithWatch, cfg *config.ReleaseTestConfig, shootName, parentSubnetName, shootNodeCIDR string, workerMin, workerMax int32, t *testing.T) client.ObjectKey {
 	shoot := &gardencorev1beta1.Shoot{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cfg.TestShoot.Name,
+			Name:      shootName,
 			Namespace: gardenv1beta1constants.GardenNamespace,
 		},
 	}
 
-	shootSpec := newShootSpec(t, cfg, shootNodeCIDR, gardenerArtifactsVersion, workerMin, workerMax)
+	shootSpec := newShootSpec(t, cfg, shootName, parentSubnetName, shootNodeCIDR, workerMin, workerMax)
 
 	_, err := controllerutil.CreateOrUpdate(ctx, gardenClient, shoot, func() error {
 		shoot.Spec = shootSpec
@@ -178,15 +200,9 @@ func createShoot(ctx context.Context, gardenClient client.WithWatch, cfg *config
 	if err != nil {
 		t.Fatalf("failed to create or update shoot %q/%q: %v", shoot.Namespace, shoot.Name, err)
 	}
-	shootKey := client.ObjectKey{Name: cfg.TestShoot.Name, Namespace: gardenv1beta1constants.GardenNamespace}
-	watchCtx, cancelWatch := context.WithCancel(ctx)
-	defer cancelWatch()
+	shootKey := client.ObjectKey{Name: shootName, Namespace: gardenv1beta1constants.GardenNamespace}
 	go ensureSeedShootNamespaceWorkarounds(watchCtx, t, cfg, shootKey)
-
-	err = gardener.WaitForShootReconciliation(ctx, gardenClient, shootKey, waitForShootCreationTimeout)
-	if err != nil {
-		t.Fatalf("shoot \"%q/%q\" reconciliation failed or timed out: %v", shoot.Namespace, shoot.Name, err)
-	}
+	return shootKey
 }
 
 // ensureSeedShootNamespaceWorkarounds applies Seed-level workarounds in the Shoot's control-plane namespace:
@@ -463,6 +479,9 @@ func validateFlags(t *testing.T) error {
 		}
 	}
 
+	if *numShoots <= 0 || *numShoots > maxNumShoots {
+		t.Fatalf("--num-shoots must be between 1 and %d, got %d", maxNumShoots, *numShoots)
+	}
 	if *workerPoolMinimum <= 0 {
 		t.Fatalf("--worker-pool-minimum must be greater than 0, got %d", *workerPoolMinimum)
 	}
